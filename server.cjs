@@ -2,13 +2,34 @@
 // Grid Vector Racer v0.9.5 — zero-dependency HTTP + WebSocket server.
 // Production TLS (wss://) is expected to terminate at the hosting platform/reverse proxy.
 const http=require('http'),fs=require('fs'),path=require('path'),crypto=require('crypto');
+const {Pool}=require('pg');
 const ROOT=__dirname,PORT=Number(process.env.PORT||8080),rooms=new Map(),MAX_SPEED=8,MAX_MESSAGE=32768,RECONNECT_MS=90000;
+const DATABASE_URL=String(process.env.DATABASE_URL||'').trim();
+const db=DATABASE_URL?new Pool({connectionString:DATABASE_URL,ssl:{rejectUnauthorized:false},max:5,idleTimeoutMillis:30000,connectionTimeoutMillis:10000}):null;
 const DIRS=[{x:0,y:-1},{x:1,y:-1},{x:1,y:0},{x:1,y:1},{x:0,y:1},{x:-1,y:1},{x:-1,y:0},{x:-1,y:-1}];
 const MIME={'.html':'text/html; charset=utf-8','.js':'text/javascript; charset=utf-8','.css':'text/css; charset=utf-8','.svg':'image/svg+xml','.json':'application/json; charset=utf-8','.webmanifest':'application/manifest+json','.ogg':'audio/ogg','.wav':'audio/wav','.mp3':'audio/mpeg'};
 const TrackClassPromise=import('./src/track.js?v=095-server').then(m=>m.Track);
 const ALLOWED_ORIGINS=(process.env.ALLOWED_ORIGINS||'').split(',').map(s=>s.trim()).filter(Boolean);
 function originAllowed(req){if(!ALLOWED_ORIGINS.length)return true;const o=String(req.headers.origin||'');return ALLOWED_ORIGINS.some(x=>x===o)}
-function serve(req,res){const pathname=decodeURIComponent(String(req.url||'/').split('?')[0]);if(pathname==='/health')return res.writeHead(200,{'Content-Type':'application/json','Cache-Control':'no-store'}).end(JSON.stringify({ok:true,rooms:rooms.size,version:'0.9.5'}));if(pathname==='/ws')return;let f=path.join(ROOT,pathname==='/'?'index.html':pathname.replace(/^\//,''));if(!f.startsWith(ROOT))return res.writeHead(403).end();fs.stat(f,(err,st)=>{if(err||!st.isFile())return res.writeHead(404).end('Not found');res.writeHead(200,{'Content-Type':MIME[path.extname(f)]||'application/octet-stream','Cache-Control':'no-cache'});fs.createReadStream(f).pipe(res)})}
+async function serve(req,res){
+  const u=new URL(String(req.url||'/'),'http://localhost'),pathname=decodeURIComponent(u.pathname);
+  if(pathname==='/health'){
+    let dbOk=false;
+    if(db){try{await db.query('select 1');dbOk=true}catch{dbOk=false}}
+    return res.writeHead(200,{'Content-Type':'application/json','Cache-Control':'no-store'}).end(JSON.stringify({ok:true,rooms:rooms.size,version:'0.9.6-db',database:dbOk}));
+  }
+  if(pathname==='/api/leaderboard'&&req.method==='GET'){
+    res.setHeader('Access-Control-Allow-Origin','*');res.setHeader('Cache-Control','no-store');
+    if(!db)return res.writeHead(503,{'Content-Type':'application/json'}).end(JSON.stringify({ok:false,error:'database-not-configured'}));
+    const sort=String(u.searchParams.get('sort')||'rating');const limit=Math.max(1,Math.min(100,Number(u.searchParams.get('limit')||20)||20));
+    const order=sort==='wins'?'wins DESC, rating DESC, id ASC':sort==='time'?'best_time_ms ASC NULLS LAST, rating DESC, id ASC':'rating DESC, wins DESC, id ASC';
+    try{const q=await db.query(`SELECT id,display_name,rating,wins,losses,races,best_time_ms FROM players ORDER BY ${order} LIMIT $1`,[limit]);return res.writeHead(200,{'Content-Type':'application/json'}).end(JSON.stringify({ok:true,sort,entries:q.rows}))}
+    catch(e){return res.writeHead(500,{'Content-Type':'application/json'}).end(JSON.stringify({ok:false,error:'database-query-failed'}))}
+  }
+  if(pathname==='/ws')return;
+  let f=path.join(ROOT,pathname==='/'?'index.html':pathname.replace(/^\//,''));if(!f.startsWith(ROOT))return res.writeHead(403).end();
+  fs.stat(f,(err,st)=>{if(err||!st.isFile())return res.writeHead(404).end('Not found');res.writeHead(200,{'Content-Type':MIME[path.extname(f)]||'application/octet-stream','Cache-Control':'no-cache'});fs.createReadStream(f).pipe(res)})
+}
 const server=http.createServer(serve);
 function frame(text){const payload=Buffer.from(text),n=payload.length;let head;if(n<126){head=Buffer.alloc(2);head[0]=0x81;head[1]=n}else if(n<65536){head=Buffer.alloc(4);head[0]=0x81;head[1]=126;head.writeUInt16BE(n,2)}else{head=Buffer.alloc(10);head[0]=0x81;head[1]=127;head.writeBigUInt64BE(BigInt(n),2)}return Buffer.concat([head,payload])}
 function decode(buf){if(buf.length<2)return null;const opcode=buf[0]&15;if(opcode===8)return{close:true,used:buf.length};let len=buf[1]&127,off=2;if(len===126){if(buf.length<4)return null;len=buf.readUInt16BE(2);off=4}else if(len===127){if(buf.length<10)return null;len=Number(buf.readBigUInt64BE(2));off=10}if(len>MAX_MESSAGE)return{tooBig:true,used:buf.length};const masked=!!(buf[1]&128);let mask;if(masked){if(buf.length<off+4)return null;mask=buf.slice(off,off+4);off+=4}if(buf.length<off+len)return null;const p=Buffer.from(buf.slice(off,off+len));if(mask)for(let i=0;i<p.length;i++)p[i]^=mask[i%4];return{data:p.toString('utf8'),used:off+len}}
@@ -51,4 +72,4 @@ async function handle(ws,m){
   }
 }
 server.on('upgrade',(req,socket)=>{if(String(req.url||'').split('?')[0]!=='/ws'||!originAllowed(req)){socket.destroy();return}const key=req.headers['sec-websocket-key'];if(!key){socket.destroy();return}const accept=crypto.createHash('sha1').update(key+'258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: '+accept+'\r\n\r\n');attach(socket)});
-server.listen(PORT,'0.0.0.0',()=>console.log(`Grid Vector Racer v0.9.5 server: http://localhost:${PORT} (WebSocket /ws)`));
+server.listen(PORT,'0.0.0.0',()=>console.log(`Grid Vector Racer v0.9.6 DB server: http://localhost:${PORT} (WebSocket /ws)`));

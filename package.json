@@ -1,8 +1,9 @@
 {
   "name": "grid-vector-racer-wss",
-  "version": "0.9.5",
+  "version": "0.9.6",
   "private": true,
   "type": "module",
   "scripts": {"start": "node server.cjs"},
-  "engines": {"node": ">=18"}
+  "engines": {"node": ">=18"},
+  "dependencies": {"pg": "^8.16.3"}
 }
