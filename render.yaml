@@ -3,7 +3,6 @@ services:
     name: grid-vector-racer-wss
     runtime: node
     plan: free
-    buildCommand: ""
+    buildCommand: npm install
     startCommand: node server.cjs
     healthCheckPath: /health
-    autoDeploy: true
